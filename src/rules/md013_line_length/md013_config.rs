@@ -1,0 +1,331 @@
+use crate::types::LineLength;
+
+pub use crate::utils::text_reflow::CjkSoftBreak;
+
+/// Reflow mode for MD013
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ReflowMode {
+    /// Only reflow lines that exceed the line length limit (default behavior)
+    #[default]
+    Default,
+    /// Normalize all paragraphs to use the full line length
+    Normalize,
+    /// One sentence per line - break at sentence boundaries
+    SentencePerLine,
+    /// Semantic line breaks - cascading strategy:
+    /// 1. Sentence boundaries (always)
+    /// 2. Clause punctuation (when line > line-length)
+    /// 3. English break-words (when line still > line-length)
+    /// 4. Word wrap (fallback)
+    SemanticLineBreaks,
+}
+
+/// Length calculation mode for MD013
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum LengthMode {
+    /// Count Unicode characters (grapheme clusters)
+    /// Use this only if you need backward compatibility with character-based counting
+    Chars,
+    /// Count visual display width (CJK characters = 2 columns, emoji = 2, etc.) - default
+    /// This is semantically correct: line-length = 80 means "80 columns on screen"
+    #[default]
+    Visual,
+    /// Count raw bytes (legacy mode, not recommended for Unicode text)
+    Bytes,
+}
+
+/// Configuration for MD013 (Line length)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MD013Config {
+    /// Maximum line length (default: 80, 0 means no limit)
+    pub line_length: LineLength,
+
+    /// Check code blocks for line length (default: true)
+    pub code_blocks: bool,
+
+    /// Check lines whose length comes from an inline code span (default: true).
+    ///
+    /// Inline code spans (`` `like this` ``) cannot be wrapped, so reflow cannot
+    /// shorten a line whose excess length is one of them. When `false`, a line is
+    /// not reported if it would fit within the limit once its inline code spans are
+    /// excluded - useful with `reflow` so an otherwise-clean file is not failed by
+    /// an unbreakable code incantation.
+    pub code_spans: bool,
+
+    /// Check tables for line length (default: false)
+    ///
+    /// Note: markdownlint defaults to true, but rumdl defaults to false to avoid
+    /// conflicts with MD060 (table formatting). Tables often require specific widths
+    /// for alignment, which can conflict with line length limits.
+    pub tables: bool,
+
+    /// Check headings for line length (default: true)
+    pub headings: bool,
+
+    /// Check display-math blocks for line length (default: true)
+    ///
+    /// A `$$ ... $$` block is unbreakable in the same way a code block or a table
+    /// row is: LaTeX cannot be wrapped without changing the equation. When
+    /// `false`, lines that hold nothing but display math are not reported. This
+    /// covers both a multi-line block and a whole line that is one complete
+    /// `$$...$$` span, delimiter lines included, matching how `code-blocks =
+    /// false` also exempts the surrounding fences.
+    ///
+    /// Inline `$...$` math is not covered, for the same reason `code-spans` is a
+    /// separate key from `code-blocks`.
+    pub math_blocks: bool,
+
+    /// Treat standalone TeX `\[ ... \]` blocks as display math. Off by default
+    /// because escaped brackets are ordinary Markdown in CommonMark.
+    pub bracket_display_math: bool,
+
+    /// Check paragraph/text line length (default: true)
+    /// When false, line length violations in regular text are not reported,
+    /// but reflow can still be used to format paragraphs.
+    pub paragraphs: bool,
+
+    /// Check blockquote content for line length (default: true)
+    /// When false, blockquote lines are not checked for line length.
+    /// When paragraphs = false, blockquote content is also skipped
+    /// since blockquote content is paragraph text.
+    pub blockquotes: bool,
+
+    /// Strict mode - disables exceptions for URLs, etc. (default: false)
+    pub strict: bool,
+
+    /// Stern mode - like strict, but lines that consist of a single
+    /// non-whitespace token (optionally prefixed by heading/blockquote
+    /// markers) are still permitted. Mirrors markdownlint's `stern` option.
+    /// Default: false.
+    pub stern: bool,
+
+    /// Whether to ignore inline link/image URLs when measuring line length
+    /// (default: true).
+    ///
+    /// In non-strict mode, a line that exceeds the limit only because of the URL
+    /// portion of an inline `[text](url)` / `![alt](url)` is forgiven (the URL
+    /// cannot be shortened). Set to `false` to count those URLs toward the line
+    /// length so the line is flagged. Combine with `stern` to flag a link line
+    /// that has wrappable text around it while still exempting a line that is a
+    /// single unbreakable token (a bare URL or a standalone link). Has no effect
+    /// in `strict` mode, which already disables all forgiveness.
+    ///
+    /// Accepts the former `semantic-link-understanding` key as an alias.
+    pub ignore_link_urls: bool,
+
+    /// Per-context maximum line length for headings.
+    ///
+    /// `None` (unset) falls back to `line_length`. `Some(0)` means "no limit
+    /// for headings". Mirrors markdownlint's `heading_line_length`.
+    pub heading_line_length: Option<LineLength>,
+
+    /// Per-context maximum line length for code blocks (fenced or indented).
+    ///
+    /// `None` (unset) falls back to `line_length`. `Some(0)` means "no limit
+    /// for code blocks". Mirrors markdownlint's `code_block_line_length`.
+    pub code_block_line_length: Option<LineLength>,
+
+    /// Enable text reflow to wrap long lines (default: false)
+    pub reflow: bool,
+
+    /// Reflow mode - how to handle reflowing (default: "long-lines")
+    pub reflow_mode: ReflowMode,
+
+    /// Length calculation mode (default: "chars")
+    /// - "chars": Count Unicode characters (emoji = 1, CJK = 1)
+    /// - "visual": Count visual display width (emoji = 2, CJK = 2)
+    /// - "bytes": Count raw bytes (not recommended for Unicode)
+    pub length_mode: LengthMode,
+
+    /// Custom abbreviations for sentence-per-line mode
+    /// Periods are optional - both "Dr" and "Dr." work the same
+    /// Inherited from global config, can be overridden per-rule
+    /// Custom abbreviations are always added to the built-in defaults
+    pub abbreviations: Vec<String>,
+
+    /// Whether to require uppercase after periods for sentence detection (default: true).
+    /// When true, "word. Capital" and "word. 2nd" are sentence boundaries and
+    /// "word. lowercase" is not: a digit opens a sentence, a lowercase letter continues one.
+    /// When false, "word. lowercase" is also treated as a sentence boundary.
+    /// A bare ! or ? always ends a sentence; inside a quotation ("Is this a test?" guide)
+    /// it follows the same rule as a period.
+    pub require_sentence_capital: bool,
+
+    /// Whether to hold emphasis/strong/strikethrough and code spans atomic during reflow.
+    /// When true (default), these spans are treated as atomic units.
+    /// When false, they can be wrapped word-by-word like normal text.
+    pub atomic_spans: bool,
+
+    /// Whether reflow may wrap long lines within the text of a link or image
+    /// (default: false).
+    ///
+    /// Off, every link and image is one atomic token: reflow moves it whole or
+    /// leaves the line long (a standalone link line is exempt from the check).
+    /// On, the bracketed text of `[text](url)` and its reference, shortcut and
+    /// image forms wraps at whitespace under the same rules `atomic-spans`
+    /// applies to emphasis spans: only when the construct alone can never fit
+    /// a line (or freely, when `atomic-spans` is off). The `](...)` tail is
+    /// never split, and a link stays whole when splitting it would leave a
+    /// line the check reports but reflow cannot fix (an oversized destination
+    /// or a title pushed past the limit).
+    pub reflow_break_link_text: bool,
+
+    /// Whether reflow measures a line with the same length exemptions the check
+    /// applies (default: false).
+    ///
+    /// Off, reflow measures the markdown as written, so a paragraph whose only
+    /// excess is an inline link destination is wrapped even though the check
+    /// forgives it. On, reflow consults `ignore_link_urls` (an inline
+    /// `[text](url)` costs `[text]`, `![alt](url)` costs `![alt]`) and
+    /// `code_spans` (a code span costs nothing), and leaves such a paragraph
+    /// alone. Reading the same options both sides read is what keeps the
+    /// formatter from producing a line the check then reports.
+    pub reflow_length_exemptions: bool,
+
+    /// How reflow joins a soft line break between CJK characters (default:
+    /// "space").
+    ///
+    /// "space" joins every soft break with a space. "join" leaves the space
+    /// out when the characters on both sides of the break are Han, kana or CJK
+    /// punctuation, for renderers that show nothing at such a break. Korean,
+    /// mixed-script breaks and breaks next to markup keep the space, and spaces
+    /// the author wrote are never removed.
+    pub cjk_soft_break: CjkSoftBreak,
+}
+
+fn default_line_length() -> LineLength {
+    LineLength::from_const(80)
+}
+
+fn default_code_blocks() -> bool {
+    true
+}
+
+fn default_code_spans() -> bool {
+    true
+}
+
+fn default_tables() -> bool {
+    false
+}
+
+fn default_headings() -> bool {
+    true
+}
+
+fn default_math_blocks() -> bool {
+    true
+}
+
+fn default_paragraphs() -> bool {
+    true
+}
+
+fn default_blockquotes() -> bool {
+    true
+}
+
+fn default_require_sentence_capital() -> bool {
+    true
+}
+
+fn default_ignore_link_urls() -> bool {
+    true
+}
+
+fn default_atomic_spans() -> bool {
+    true
+}
+
+impl Default for MD013Config {
+    fn default() -> Self {
+        Self {
+            line_length: default_line_length(),
+            code_blocks: default_code_blocks(),
+            code_spans: default_code_spans(),
+            tables: default_tables(),
+            headings: default_headings(),
+            math_blocks: default_math_blocks(),
+            bracket_display_math: false,
+            paragraphs: default_paragraphs(),
+            blockquotes: default_blockquotes(),
+            strict: false,
+            stern: false,
+            ignore_link_urls: default_ignore_link_urls(),
+            heading_line_length: None,
+            code_block_line_length: None,
+            reflow: false,
+            reflow_mode: ReflowMode::default(),
+            length_mode: LengthMode::default(),
+            abbreviations: Vec::new(),
+            require_sentence_capital: default_require_sentence_capital(),
+            atomic_spans: default_atomic_spans(),
+            reflow_break_link_text: false,
+            reflow_length_exemptions: false,
+            cjk_soft_break: CjkSoftBreak::default(),
+        }
+    }
+}
+
+impl MD013Config {
+    /// Effective line-length budget for heading lines.
+    /// Falls back to `line_length` when `heading_line_length` is unset.
+    pub(crate) fn effective_heading_line_length(&self) -> LineLength {
+        self.heading_line_length.unwrap_or(self.line_length)
+    }
+
+    /// Effective line-length budget for fenced or indented code-block lines.
+    /// Falls back to `line_length` when `code_block_line_length` is unset.
+    pub(crate) fn effective_code_block_line_length(&self) -> LineLength {
+        self.code_block_line_length.unwrap_or(self.line_length)
+    }
+
+    /// Smallest applicable line-length budget across all contexts. Used to
+    /// pre-filter candidate lines: any line shorter than this can never
+    /// violate, regardless of which context it falls under.
+    pub(crate) fn min_effective_line_length(&self) -> LineLength {
+        [
+            Some(self.line_length),
+            self.heading_line_length,
+            self.code_block_line_length,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|l| !l.is_unlimited())
+        .min_by_key(|l| l.get())
+        .unwrap_or(LineLength::from_const(0))
+    }
+
+    /// Convert abbreviations Vec to Option for ReflowOptions
+    /// Empty Vec means "use defaults only" so it maps to None
+    pub(crate) fn abbreviations_for_reflow(&self) -> Option<Vec<String>> {
+        if self.abbreviations.is_empty() {
+            None
+        } else {
+            Some(self.abbreviations.clone())
+        }
+    }
+
+    /// The checker's length exemptions, in the form reflow mirrors them.
+    ///
+    /// Empty unless `reflow_length_exemptions` opts in, and then derived from the
+    /// very options the check path reads, so the two measures cannot drift.
+    pub(crate) fn length_exemptions_for_reflow(&self) -> crate::utils::text_reflow::LengthExemptions {
+        if !self.reflow_length_exemptions {
+            return crate::utils::text_reflow::LengthExemptions::default();
+        }
+        crate::utils::text_reflow::LengthExemptions {
+            link_urls: !self.strict && self.ignore_link_urls,
+            code_spans: !self.code_spans,
+        }
+    }
+
+    /// Map the configured length mode to the reflow engine's length mode.
+    pub(crate) fn reflow_length_mode(&self) -> crate::utils::text_reflow::ReflowLengthMode {
+        match self.length_mode {
+            LengthMode::Chars => crate::utils::text_reflow::ReflowLengthMode::Chars,
+            LengthMode::Visual => crate::utils::text_reflow::ReflowLengthMode::Visual,
+            LengthMode::Bytes => crate::utils::text_reflow::ReflowLengthMode::Bytes,
+        }
+    }
+}

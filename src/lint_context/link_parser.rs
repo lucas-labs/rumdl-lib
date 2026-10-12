@@ -1,0 +1,875 @@
+use crate::config::MarkdownFlavor;
+use crate::utils::code_block_utils::CodeBlockUtils;
+use crate::utils::rumdl_parser_options;
+use pulldown_cmark::{BrokenLink, Event, LinkType, Tag, TagEnd};
+use regex::Regex;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use super::types::*;
+
+// Comprehensive link pattern that captures both inline and reference links
+// Use (?s) flag to make . match newlines.
+//
+// Title alternatives include all three CommonMark §6.7 delimiter forms:
+// `"..."` (group 4), `'...'` (group 5), and `(...)` (group 6). The paren form
+// is required so MkDocs admonition fallbacks (which only fire when
+// pulldown-cmark misses the link) don't silently drop a `[t](url (title))`
+// title — that would let MD054 auto-fix rewrite the link without it,
+// changing semantics.
+static LINK_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?sx)
+        \[((?:[^\[\]\\]|\\.)*)\]          # Link text in group 1 (optimized - no nested brackets to prevent catastrophic backtracking)
+        (?:
+            \((?:<([^<>\n]*)>|([^\s)"']*))(?:\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|\(((?:[^()\\]|\\.)*)\)))?\)  # URL in group 2 (angle) or 3 (bare), title in 4 (dq) / 5 (sq) / 6 (paren)
+            |
+            \[([^\]]*)\]      # Reference ID in group 7
+        )"#
+    ).unwrap()
+});
+
+// Image pattern (similar to links but with ! prefix)
+// Use (?s) flag to make . match newlines.
+//
+// Mirrors LINK_PATTERN's title-form alternatives so the MkDocs fallback
+// recognizes paren-form titles in `![alt](url (title))` images.
+static IMAGE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?sx)
+        !\[((?:[^\[\]\\]|\\.)*)\]         # Alt text in group 1 (optimized - no nested brackets to prevent catastrophic backtracking)
+        (?:
+            \((?:<([^<>\n]*)>|([^\s)"']*))(?:\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|\(((?:[^()\\]|\\.)*)\)))?\)  # URL in group 2 (angle) or 3 (bare), title in 4 (dq) / 5 (sq) / 6 (paren)
+            |
+            \[([^\]]*)\]      # Reference ID in group 7
+        )"#
+    ).unwrap()
+});
+
+/// Pulldown-cmark's offset_iter range for `Collapsed` links and images covers
+/// only the `[text]` portion, omitting the trailing `[]` that distinguishes
+/// the collapsed form from a shortcut. Extend the end offset to include those
+/// two bytes so consumers see the full syntactic span (notably MD054's
+/// auto-fix, which replaces the entire link span when converting styles).
+fn extend_collapsed_byte_end(content: &str, link_type: LinkType, byte_end: usize) -> usize {
+    if !matches!(link_type, LinkType::Collapsed) {
+        return byte_end;
+    }
+    let bytes = content.as_bytes();
+    if bytes.get(byte_end) == Some(&b'[') && bytes.get(byte_end + 1) == Some(&b']') {
+        byte_end + 2
+    } else {
+        byte_end
+    }
+}
+
+// Reference definition pattern
+//
+// Mirrors the CommonMark §4.7 grammar closely enough for downstream consumers
+// (MD053, MD057, the MD054 round-trip pass) to see every valid ref def:
+//
+// - **Label** (group 1) ends at the first `]` that is *not* backslash-escaped,
+//   so `\]` stays inside the label (`[a\[\]]: url` is one definition). A scan
+//   that stops at any `]` fails the whole anchored match and drops the
+//   definition, which makes MD034 lint the destination as a bare URL and hides
+//   it from MD053. The label is captured raw: CommonMark normalization
+//   case-folds and collapses whitespace but does not unescape, and
+//   pulldown-cmark reports the raw id, so both sides must agree to match.
+//
+// - **Destination** has two §6.6 forms: a bare sequence containing no spaces
+//   (group 3), or an angle-bracketed sequence that may contain spaces but no
+//   line endings or unescaped `<`/`>` (group 2). Without the angle form,
+//   destinations like `<./has space.md>` (which `format_url_destination`
+//   emits whenever the URL would otherwise be unparseable inline) silently
+//   drop out of `ctx.reference_defs`.
+//
+// - **Title** has three §4.7 delimiter forms — `"..."` (group 4), `'...'`
+//   (group 5), and `(...)` (group 6). All three branches permit backslash
+//   escapes so titles like `"he said \"hi\""`, `'it\'s fine'`, or
+//   `(title \(x\))` parse — per spec, an unescaped delimiter would
+//   otherwise terminate the title prematurely.
+//
+// Round-trip safety: the angle-bracket destination and the double/single
+// quoted title forms accept `\<delim>` (and `\\`) so that values emitted
+// by `format_url_destination` / `format_title` (e.g. `<a\<b\>c>` or
+// `"he said \"hi\""`) re-parse on the next lint pass instead of dropping
+// out of `ctx.reference_defs` and breaking MD053/MD057 follow-ups.
+static REF_DEF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^[ ]{0,3}\[((?:[^\]\\]|\\.)+)\]:\s*(?:<((?:[^<>\n\\]|\\.)*)>|([^\s<][^\s]*))(?:\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|\(((?:[^()\\]|\\.)*)\)))?$"#,
+    )
+    .unwrap()
+});
+
+// CommonMark §4.7 allows a reference definition's title to appear on the line
+// immediately after the destination. This matches a line that is *only* such a
+// title (double-quoted, single-quoted, or parenthesised), with the same escape
+// handling as `REF_DEF_PATTERN`. The capture groups mirror the title groups
+// (1 = "...", 2 = '...', 3 = (...)) so the same unescape path applies.
+static REF_DEF_TITLE_CONTINUATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|\(((?:[^()\\]|\\.)*)\))\s*$"#).unwrap()
+});
+
+/// How many of the lines a paragraph opens with are link reference definitions.
+/// Those definitions are not the paragraph's text (CommonMark 4.7), so its text
+/// starts below them. A definition may carry its destination, and the title
+/// after that, on the lines below its label, so the lines are read together the
+/// way the parser reads them: the text starts where its first block starts, and
+/// a paragraph of definitions alone has no text at all. A footnote definition
+/// is a block of its own rather than a reference definition, and ends the count.
+pub(super) fn leading_reference_definition_lines(lines: &[&str]) -> usize {
+    if !lines.first().is_some_and(|line| line.trim_start().starts_with('[')) {
+        return 0;
+    }
+    let text = lines.join("\n");
+    let first_block = pulldown_cmark::Parser::new_ext(&text, rumdl_parser_options())
+        .into_offset_iter()
+        .next()
+        .map_or(text.len(), |(_, range)| range.start);
+    text[..first_block].matches('\n').count() + usize::from(first_block == text.len())
+}
+
+/// Intermediate result from the pulldown-cmark parse phase.
+/// Regex fallback and code_span filtering happen in the finalize phase.
+pub(super) struct PulldownParseResult<'a> {
+    pub(crate) link_byte_ranges: Vec<(usize, usize)>,
+    pub(crate) links: Vec<ParsedLink<'a>>,
+    pub(crate) images: Vec<ParsedImage<'a>>,
+    pub(crate) broken_links: Vec<BrokenLinkInfo>,
+    pub(crate) footnote_refs: Vec<FootnoteRef>,
+    pub(crate) link_found_positions: HashSet<usize>,
+    pub(crate) image_found_positions: HashSet<usize>,
+}
+
+/// Phase A: Run a single pulldown-cmark parse to collect link byte ranges,
+/// links, images, broken links, and footnote references.
+/// Does NOT require code_spans (those are computed later).
+pub(super) fn parse_links_images_pulldown<'a>(
+    content: &'a str,
+    lines: &[LineInfo],
+    code_blocks: &[(usize, usize)],
+    flavor: MarkdownFlavor,
+    html_comment_ranges: &[crate::utils::skip_context::ByteRange],
+) -> PulldownParseResult<'a> {
+    use crate::utils::skip_context::{is_in_html_comment_ranges, is_mkdocs_snippet_line};
+
+    let mut link_byte_ranges = Vec::new();
+    let mut links = Vec::with_capacity(content.len() / 500);
+    let mut images = Vec::with_capacity(content.len() / 1000);
+    let mut broken_links = Vec::new();
+    let mut footnote_refs = Vec::new();
+    let mut link_found_positions = HashSet::new();
+    let mut image_found_positions = HashSet::new();
+
+    let options = rumdl_parser_options();
+
+    let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
+        content,
+        options,
+        Some(|link: BrokenLink<'_>| {
+            let span_end = extend_collapsed_byte_end(content, link.link_type, link.span.end);
+            broken_links.push(BrokenLinkInfo {
+                span: link.span.start..span_end,
+                link_type: link.link_type,
+            });
+            None
+        }),
+    )
+    .into_offset_iter();
+
+    type StackEntry<'b> = (
+        usize,
+        pulldown_cmark::CowStr<'b>,
+        LinkType,
+        pulldown_cmark::CowStr<'b>,
+        pulldown_cmark::CowStr<'b>,
+    );
+
+    /// A link the parser has opened but not yet closed.
+    ///
+    /// `label_end` grows to the furthest byte any event inside the label
+    /// reaches, which is where the inline parse puts the label's closing
+    /// bracket.
+    struct OpenLink<'b> {
+        start: usize,
+        label_end: usize,
+        url: pulldown_cmark::CowStr<'b>,
+        link_type: LinkType,
+        id: pulldown_cmark::CowStr<'b>,
+    }
+
+    let mut link_stack: Vec<OpenLink<'a>> = Vec::new();
+    let mut image_stack: Vec<StackEntry<'a>> = Vec::new();
+    let mut link_text_chunks: Vec<(String, usize, usize)> = Vec::new();
+
+    for (event, range) in parser {
+        // The label of an open link ends at the last byte the events inside it
+        // reach, nested image events included. The link's own Start and End
+        // span the whole link, destination and title included, so they say
+        // nothing about where the label closes. A collapsed image's range
+        // stops short of its `[]`, which is part of the label, so its span is
+        // extended the way the image's own record is. The Start carries the
+        // link type and shares the End's range, so the Start is where the
+        // extension is applied.
+        if let Some(open) = link_stack.last_mut()
+            && !matches!(&event, Event::Start(Tag::Link { .. }) | Event::End(TagEnd::Link))
+        {
+            let event_end = match &event {
+                Event::Start(Tag::Image { link_type, .. }) => extend_collapsed_byte_end(content, *link_type, range.end),
+                _ => range.end,
+            };
+            open.label_end = open.label_end.max(event_end);
+        }
+
+        match event {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title: _,
+                id,
+            }) => {
+                link_stack.push(OpenLink {
+                    start: range.start,
+                    label_end: range.start + 1,
+                    url: dest_url,
+                    link_type,
+                    id,
+                });
+                link_text_chunks.clear();
+            }
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
+                image_stack.push((range.start, dest_url, link_type, id, title));
+            }
+            // Only wikilinks read these chunks; every other link and image
+            // takes its text from the source between its own brackets.
+            Event::Text(text) if !link_stack.is_empty() => {
+                link_text_chunks.push((text.to_string(), range.start, range.end));
+            }
+            Event::Code(code) if !link_stack.is_empty() => {
+                let code_text = format!("`{code}`");
+                link_text_chunks.push((code_text, range.start, range.end));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some(OpenLink {
+                    start: start_pos,
+                    label_end,
+                    url,
+                    link_type,
+                    id: _ref_id,
+                }) = link_stack.pop()
+                {
+                    let span_end = extend_collapsed_byte_end(content, link_type, range.end);
+                    // Track link byte range for heading detection
+                    link_byte_ranges.push((start_pos, span_end));
+
+                    if is_in_html_comment_ranges(html_comment_ranges, start_pos) {
+                        link_text_chunks.clear();
+                        continue;
+                    }
+
+                    let (line_idx, line_num, _col_start) =
+                        super::LintContext::find_line_for_offset(lines, content, start_pos);
+
+                    if is_mkdocs_snippet_line(lines[line_idx].content(content), flavor) {
+                        link_text_chunks.clear();
+                        continue;
+                    }
+
+                    let (_, _end_line_num, _col_end) =
+                        super::LintContext::find_line_for_offset(lines, content, span_end);
+
+                    let is_reference = matches!(
+                        link_type,
+                        LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut
+                    );
+
+                    // The text is the source between the brackets, so escaping,
+                    // code spans and inline HTML are preserved as written. The
+                    // closing bracket comes from the inline parse rather than
+                    // from a second scan of the bytes, which is what keeps a
+                    // label such as `<i title="[">x</i>` or a code span holding
+                    // `](` from being read as ending somewhere else.
+                    let link_text = if matches!(link_type, LinkType::WikiLink { .. }) {
+                        if !link_text_chunks.is_empty() {
+                            let text: String = link_text_chunks.iter().map(|(t, _, _)| t.as_str()).collect();
+                            Cow::Owned(text)
+                        } else {
+                            Cow::Owned(url.to_string())
+                        }
+                    } else if matches!(link_type, LinkType::Autolink | LinkType::Email) {
+                        // An autolink is written between angle brackets and has
+                        // no label to read.
+                        Cow::Borrowed("")
+                    } else {
+                        // Events cover the label's inline content, so they stop
+                        // at the last of it. What follows is filler the parse
+                        // carries no event for: whitespace ending the label, or
+                        // the blockquote marker on a continuation line. Filler
+                        // holds no inline content, so the first bracket from
+                        // there is the label's own.
+                        let close = label_end + content[label_end..].find(']').unwrap_or(0);
+                        debug_assert!(
+                            close < span_end && content.as_bytes().get(close) == Some(&b']'),
+                            "link label at {start_pos} does not close on a bracket inside its own span: {:?}",
+                            &content[start_pos..span_end.min(content.len())]
+                        );
+                        Cow::Borrowed(&content[start_pos + 1..close])
+                    };
+
+                    link_found_positions.insert(start_pos);
+
+                    links.push(ParsedLink {
+                        line: line_num,
+                        byte_offset: start_pos,
+                        byte_end: span_end,
+                        text: link_text,
+                        url: Cow::Owned(url.to_string()),
+                        is_reference,
+                        link_type,
+                    });
+
+                    link_text_chunks.clear();
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((start_pos, url, link_type, _ref_id, _title)) = image_stack.pop() {
+                    let span_end = extend_collapsed_byte_end(content, link_type, range.end);
+
+                    if CodeBlockUtils::is_in_code_block(code_blocks, start_pos) {
+                        continue;
+                    }
+
+                    // Skip code_span check here; deferred to finalize phase
+                    // where code_spans are available.
+
+                    if is_in_html_comment_ranges(html_comment_ranges, start_pos) {
+                        continue;
+                    }
+
+                    let (_, line_num, _col_start) = super::LintContext::find_line_for_offset(lines, content, start_pos);
+                    let (_, _end_line_num, _col_end) =
+                        super::LintContext::find_line_for_offset(lines, content, span_end);
+
+                    let is_reference = matches!(
+                        link_type,
+                        LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut
+                    );
+
+                    let alt_text = if matches!(link_type, LinkType::WikiLink { .. }) {
+                        // An embed has no alt-text slot. `![[note]]` transcludes
+                        // the target's content, and the pipe in `![[img.png|100]]`
+                        // sets the rendered dimensions, not a description.
+                        Cow::Borrowed("")
+                    } else if start_pos < content.len() {
+                        let image_bytes = &content.as_bytes()[start_pos..range.end.min(content.len())];
+
+                        let mut close_pos = None;
+                        let mut depth = 0;
+
+                        if image_bytes.len() > 2 {
+                            for (i, &byte) in image_bytes.iter().enumerate().skip(2) {
+                                let mut backslash_count = 0;
+                                let mut j = i;
+                                while j > 0 && image_bytes[j - 1] == b'\\' {
+                                    backslash_count += 1;
+                                    j -= 1;
+                                }
+                                let is_escaped = backslash_count % 2 != 0;
+
+                                if !is_escaped {
+                                    if byte == b'[' {
+                                        depth += 1;
+                                    } else if byte == b']' {
+                                        if depth == 0 {
+                                            close_pos = Some(i);
+                                            break;
+                                        } else {
+                                            depth -= 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(pos) = close_pos {
+                            Cow::Borrowed(std::str::from_utf8(&image_bytes[2..pos]).unwrap_or(""))
+                        } else {
+                            Cow::Borrowed("")
+                        }
+                    } else {
+                        Cow::Borrowed("")
+                    };
+
+                    let url = Cow::Owned(url.to_string());
+
+                    image_found_positions.insert(start_pos);
+
+                    images.push(ParsedImage {
+                        line: line_num,
+                        byte_offset: start_pos,
+                        byte_end: span_end,
+                        alt_text,
+                        url,
+                        is_reference,
+                        link_type,
+                    });
+                }
+            }
+            Event::FootnoteReference(_footnote_id) => {
+                if is_in_html_comment_ranges(html_comment_ranges, range.start) {
+                    continue;
+                }
+
+                let (_, _line_num, _) = super::LintContext::find_line_for_offset(lines, content, range.start);
+                footnote_refs.push(FootnoteRef {});
+            }
+            _ => {}
+        }
+    }
+
+    PulldownParseResult {
+        link_byte_ranges,
+        links,
+        images,
+        broken_links,
+        footnote_refs,
+        link_found_positions,
+        image_found_positions,
+    }
+}
+
+/// True when a regex-fallback match sits in raw HTML, where CommonMark parses no
+/// markdown and the construct renders as literal text.
+///
+/// MkDocs containers are the exception: an admonition body, a content tab and a
+/// `markdown="1"` block all hold real markdown, and the last of those is marked
+/// `in_html_block` as well.
+fn is_literal_html_context(line_info: &LineInfo) -> bool {
+    line_info.in_html_block && !line_info.in_mkdocs_container()
+}
+
+/// Contexts where a link-looking string must not enter the link index.
+pub(super) struct LinkExclusions<'a> {
+    pub(crate) code_blocks: &'a [(usize, usize)],
+    pub(crate) code_spans: &'a [CodeSpan],
+    pub(crate) html_comment_ranges: &'a [crate::utils::skip_context::ByteRange],
+}
+
+/// Phase B: Filter images by code_spans, run regex fallbacks, and sort results.
+/// Requires code_spans which are computed after heading detection.
+pub(super) fn finalize_links_and_images<'a>(
+    content: &'a str,
+    lines: &[LineInfo],
+    flavor: MarkdownFlavor,
+    exclusions: &LinkExclusions<'_>,
+    mut result: PulldownParseResult<'a>,
+) -> (
+    Vec<ParsedLink<'a>>,
+    Vec<ParsedImage<'a>>,
+    Vec<BrokenLinkInfo>,
+    Vec<FootnoteRef>,
+) {
+    use crate::utils::skip_context::{is_in_html_comment_ranges, is_mkdocs_snippet_line};
+
+    let LinkExclusions {
+        code_blocks,
+        code_spans,
+        html_comment_ranges,
+    } = *exclusions;
+
+    // Filter out images that fall inside code spans (deferred from Phase A)
+    result
+        .images
+        .retain(|img| !super::LintContext::is_offset_in_code_span(code_spans, img.byte_offset));
+
+    // Convert broken links to ParsedLink and add them to result.links
+    for broken in &result.broken_links {
+        let start_pos = broken.span.start;
+        let span_end = broken.span.end;
+
+        if is_in_html_comment_ranges(html_comment_ranges, start_pos) {
+            continue;
+        }
+
+        let (line_idx, line_num, _col_start) = super::LintContext::find_line_for_offset(lines, content, start_pos);
+
+        if is_mkdocs_snippet_line(lines[line_idx].content(content), flavor) {
+            continue;
+        }
+
+        let (_, _end_line_num, _col_end) = super::LintContext::find_line_for_offset(lines, content, span_end);
+
+        let raw_span = &content[broken.span.clone()];
+        let is_image = raw_span.starts_with('!');
+        let bracketed = if is_image { &raw_span[1..] } else { raw_span };
+        let link_text = if bracketed.starts_with('[') {
+            let mut depth = 0;
+            let mut close_pos = None;
+            for (i, byte) in bracketed.bytes().enumerate().skip(1) {
+                if byte == b'[' {
+                    depth += 1;
+                } else if byte == b']' {
+                    if depth == 0 {
+                        close_pos = Some(i);
+                        break;
+                    } else {
+                        depth -= 1;
+                    }
+                }
+            }
+            if let Some(pos) = close_pos {
+                &bracketed[1..pos]
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+
+        if is_image {
+            result.images.push(ParsedImage {
+                line: line_num,
+                byte_offset: start_pos,
+                byte_end: span_end,
+                alt_text: Cow::Owned(link_text.to_string()),
+                url: Cow::Borrowed(""),
+                is_reference: true,
+                link_type: broken.link_type,
+            });
+            result.image_found_positions.insert(start_pos);
+        } else {
+            result.links.push(ParsedLink {
+                line: line_num,
+                byte_offset: start_pos,
+                byte_end: span_end,
+                text: Cow::Owned(link_text.to_string()),
+                url: Cow::Borrowed(""),
+                is_reference: true,
+                link_type: broken.link_type,
+            });
+            result.link_found_positions.insert(start_pos);
+        }
+    }
+
+    // Regex fallback for links: find undefined references missed by pulldown-cmark
+    for cap in LINK_PATTERN.captures_iter(content) {
+        let full_match = cap.get(0).unwrap();
+        let match_start = full_match.start();
+        let match_end = full_match.end();
+
+        if result.link_found_positions.contains(&match_start) {
+            continue;
+        }
+
+        if match_start > 0 && content.as_bytes().get(match_start - 1) == Some(&b'\\') {
+            continue;
+        }
+
+        if match_start > 0 && content.as_bytes().get(match_start - 1) == Some(&b'!') {
+            continue;
+        }
+
+        if CodeBlockUtils::is_in_code_block(code_blocks, match_start) {
+            continue;
+        }
+
+        if super::LintContext::is_offset_in_code_span(code_spans, match_start) {
+            continue;
+        }
+
+        if is_in_html_comment_ranges(html_comment_ranges, match_start) {
+            continue;
+        }
+
+        let (line_idx, line_num, _col_start) = super::LintContext::find_line_for_offset(lines, content, match_start);
+
+        if is_mkdocs_snippet_line(lines[line_idx].content(content), flavor) {
+            continue;
+        }
+
+        if lines.get(line_idx).is_some_and(is_literal_html_context) {
+            continue;
+        }
+
+        let (_, _end_line_num, _col_end) = super::LintContext::find_line_for_offset(lines, content, match_end);
+
+        let text = cap.get(1).map_or("", |m| m.as_str());
+
+        if let Some(_ref_id) = cap.get(7) {
+            result.links.push(ParsedLink {
+                line: line_num,
+                byte_offset: match_start,
+                byte_end: match_end,
+                text: Cow::Borrowed(text),
+                url: Cow::Borrowed(""),
+                is_reference: true,
+                link_type: LinkType::Reference,
+            });
+        } else if let Some(line_info) = lines.get(line_idx)
+            && line_info.in_mkdocs_container()
+        {
+            // Inline links inside MkDocs admonitions/tabs that pulldown-cmark missed
+            // because it treated the indented content as code blocks. All three
+            // CommonMark §6.7 title delimiter forms must be recognized so links
+            // like `[x](url (title))` don't get auto-fixed without their title.
+            // CommonMark §6.1 backslash escapes are unescaped to match the
+            // pulldown-cmark path (see `unescape_commonmark_punctuation`).
+            let url = cap
+                .get(2)
+                .or_else(|| cap.get(3))
+                .map_or(String::new(), |m| unescape_commonmark_punctuation(m.as_str().trim()));
+            result.links.push(ParsedLink {
+                line: line_num,
+                byte_offset: match_start,
+                byte_end: match_end,
+                text: Cow::Borrowed(text),
+                url: Cow::Owned(url),
+                is_reference: false,
+                link_type: LinkType::Inline,
+            });
+        }
+    }
+
+    // Regex fallback for images: find undefined references missed by pulldown-cmark
+    for cap in IMAGE_PATTERN.captures_iter(content) {
+        let full_match = cap.get(0).unwrap();
+        let match_start = full_match.start();
+        let match_end = full_match.end();
+
+        if result.image_found_positions.contains(&match_start) {
+            continue;
+        }
+
+        if match_start > 0 && content.as_bytes().get(match_start - 1) == Some(&b'\\') {
+            continue;
+        }
+
+        if CodeBlockUtils::is_in_code_block(code_blocks, match_start)
+            || super::LintContext::is_offset_in_code_span(code_spans, match_start)
+            || is_in_html_comment_ranges(html_comment_ranges, match_start)
+        {
+            continue;
+        }
+
+        let (line_idx, line_num, _col_start) = super::LintContext::find_line_for_offset(lines, content, match_start);
+
+        if lines.get(line_idx).is_some_and(is_literal_html_context) {
+            continue;
+        }
+
+        let (_, _end_line_num, _col_end) = super::LintContext::find_line_for_offset(lines, content, match_end);
+        let alt_text = cap.get(1).map_or("", |m| m.as_str());
+
+        if let Some(_ref_id) = cap.get(7) {
+            result.images.push(ParsedImage {
+                line: line_num,
+                byte_offset: match_start,
+                byte_end: match_end,
+                alt_text: Cow::Borrowed(alt_text),
+                url: Cow::Borrowed(""),
+                is_reference: true,
+                link_type: LinkType::Reference,
+            });
+        } else if let Some(line_info) = lines.get(line_idx)
+            && line_info.in_mkdocs_container()
+        {
+            // Inline images inside MkDocs admonitions/tabs that pulldown-cmark missed
+            // because it treated the indented content as code blocks. All three
+            // CommonMark §6.7 title delimiter forms must be recognized so images
+            // like `![alt](url (title))` don't lose their title on auto-fix.
+            // CommonMark §6.1 backslash escapes are unescaped to match the
+            // pulldown-cmark path (see `unescape_commonmark_punctuation`).
+            let url = cap
+                .get(2)
+                .or_else(|| cap.get(3))
+                .map_or(String::new(), |m| unescape_commonmark_punctuation(m.as_str().trim()));
+            result.images.push(ParsedImage {
+                line: line_num,
+                byte_offset: match_start,
+                byte_end: match_end,
+                alt_text: Cow::Borrowed(alt_text),
+                url: Cow::Owned(url),
+                is_reference: false,
+                link_type: LinkType::Inline,
+            });
+        }
+    }
+
+    // Sort by line number so binary search consumers work correctly.
+    result.links.sort_by_key(|l| (l.line, l.byte_offset));
+    result.images.sort_by_key(|i| (i.line, i.byte_offset));
+
+    (result.links, result.images, result.broken_links, result.footnote_refs)
+}
+
+/// CommonMark §6.1 backslash escapes: a backslash followed by any ASCII
+/// punctuation character represents that character literally; backslashes
+/// before any other character (or at end of input) are preserved verbatim.
+///
+/// pulldown-cmark applies this transformation when it parses URLs and titles,
+/// so downstream rules that read the parser's `Tag::Link`/`Tag::Image` values
+/// see unescaped strings. The regex fallback in `parse_reference_defs` reads
+/// the raw source slice between the destination/title delimiters, so it must
+/// apply the same transform for the two views to agree. Without this, a
+/// definition like `[id]: /path "with \"quote\""` would expose
+/// `with \"quote\"` to MD054/MD053, and a transformer that copies that string
+/// back into the document would either double-escape or leave the wrong
+/// character count.
+fn unescape_commonmark_punctuation(input: &str) -> String {
+    if !input.contains('\\') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() && is_ascii_punctuation(bytes[i + 1]) {
+            out.push(bytes[i + 1] as char);
+            i += 2;
+        } else {
+            // Push the next UTF-8 scalar (could be multi-byte).
+            let ch_len = utf8_char_len(b);
+            out.push_str(&input[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+#[inline]
+fn is_ascii_punctuation(b: u8) -> bool {
+    // CommonMark §2.1: ASCII punctuation = !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+    matches!(
+        b,
+        b'!' | b'"'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b'-'
+            | b'.'
+            | b'/'
+            | b':'
+            | b';'
+            | b'<'
+            | b'='
+            | b'>'
+            | b'?'
+            | b'@'
+            | b'['
+            | b'\\'
+            | b']'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'~'
+    )
+}
+
+#[inline]
+fn utf8_char_len(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // Continuation/invalid byte; advance by 1 to avoid infinite loop.
+    }
+}
+
+/// Parse reference definitions
+pub(super) fn parse_reference_defs(content: &str, lines: &[LineInfo]) -> Vec<ReferenceDef> {
+    let mut refs = Vec::with_capacity(lines.len() / 20);
+
+    for (line_idx, line_info) in lines.iter().enumerate() {
+        if line_info.in_code_block {
+            continue;
+        }
+
+        let line_num = line_idx + 1;
+
+        // Reference definitions are document-global per CommonMark even inside a
+        // blockquote (`> [id]: url`). Match the quoted content and offset the byte
+        // positions past the blockquote prefix; plain lines are matched verbatim.
+        let (line, base_offset) = match line_info.blockquote.as_deref() {
+            Some(bq) => (bq.content.as_str(), line_info.byte_offset + bq.prefix.len()),
+            None => (line_info.content(content), line_info.byte_offset),
+        };
+
+        if let Some(cap) = REF_DEF_PATTERN.captures(line) {
+            let id_raw = cap.get(1).unwrap().as_str();
+
+            // Skip footnote definitions
+            if id_raw.starts_with('^') {
+                continue;
+            }
+
+            let id = id_raw.to_lowercase();
+            // Group 2: <...> destination (angle-bracket content stripped).
+            // Group 3: bare destination.
+            // CommonMark §6.1: apply backslash unescape so the regex fallback
+            // produces the same string as pulldown-cmark's parsed value.
+            let url = unescape_commonmark_punctuation(
+                cap.get(2)
+                    .or_else(|| cap.get(3))
+                    .expect("destination alternation always matches")
+                    .as_str(),
+            );
+            // Group 4: "..." title, group 5: '...' title, group 6: (...) title.
+            let title_match = cap.get(4).or_else(|| cap.get(5)).or_else(|| cap.get(6));
+
+            let match_obj = cap.get(0).unwrap();
+            let byte_offset = base_offset + match_obj.start();
+
+            let mut byte_end = base_offset + match_obj.end();
+
+            // CommonMark §4.7: when the destination line carries no title, the
+            // title may be on the immediately following line (no blank line
+            // between, same blockquote context, not in a code block). Pull it in
+            // so the whole definition is one reference definition.
+            if title_match.is_none()
+                && let Some(next) = lines.get(line_idx + 1)
+                && !next.in_code_block
+            {
+                let cur_nesting = line_info.blockquote.as_deref().map_or(0, |bq| bq.nesting_level);
+                let (next_line, _next_base, next_nesting) = match next.blockquote.as_deref() {
+                    Some(bq) => (
+                        bq.content.as_str(),
+                        next.byte_offset + bq.prefix.len(),
+                        bq.nesting_level,
+                    ),
+                    None => (next.content(content), next.byte_offset, 0),
+                };
+                if next_nesting == cur_nesting && REF_DEF_TITLE_CONTINUATION.is_match(next_line) {
+                    byte_end = next.byte_offset + next.byte_len;
+                }
+            }
+
+            refs.push(ReferenceDef {
+                line: line_num,
+                id,
+                url,
+                byte_offset,
+                byte_end,
+            });
+        }
+    }
+
+    refs
+}
